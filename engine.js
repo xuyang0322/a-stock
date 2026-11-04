@@ -6,13 +6,13 @@
  */
 (function () {
   "use strict";
-  const VERSION = "2.0-tx-web";
+  const VERSION = "2.2-tx-web";
   const CONFIG = {
     top_n: 30, tech_candidates: 300,
     exclude_st: true, exclude_limit: true,
-    min_mcap_yi: 50, min_amount_yi: 0, pe_ttm_range: [0, 100],
-    min_roe_annual: 6.0, min_profit_yoy: -30.0, min_kline_days: 120,
-    weights: { fundamental: 0.35, capital: 0.30, technical: 0.35 },
+    min_mcap_yi: 50, min_amount_yi: 0, pe_ttm_range: null,           // 短线：不看基本面
+    min_roe_annual: null, min_profit_yoy: null, min_kline_days: 120,
+    weights: { fundamental: 0.0, capital: 0.45, technical: 0.55 },
     pattern_days: 5, pattern_min_mcap_yi: 50, pattern_min_amount_yi: 0,
     pullback_range: [-2.0, 0.0], pattern_max_list: 50,
   };
@@ -69,6 +69,59 @@
     return out;
   }
 
+  // ───────── 本机缓存：K 线历史放 IndexedDB，财报放 localStorage（当天有效）─────────
+  const idb = (() => {
+    let dbp = null;
+    const open = () => {
+      if (dbp) return dbp;
+      dbp = new Promise((res) => {
+        try {
+          if (typeof indexedDB === "undefined") return res(null);
+          const rq = indexedDB.open("astock", 1);
+          rq.onupgradeneeded = () => rq.result.createObjectStore("kline");
+          rq.onsuccess = () => res(rq.result);
+          rq.onerror = () => res(null);
+        } catch (e) { res(null); }
+      });
+      return dbp;
+    };
+    const tx = async (mode, fn) => {
+      const db = await open();
+      if (!db) return null;
+      return new Promise((res) => {
+        try {
+          const t = db.transaction("kline", mode);
+          const r = fn(t.objectStore("kline"));
+          t.oncomplete = () => res(r && "result" in r ? r.result : null);
+          t.onerror = t.onabort = () => res(null);
+        } catch (e) { res(null); }
+      });
+    };
+    return {
+      getMany: async (keys) => {
+        const db = await open();
+        if (!db) return new Map();
+        return new Promise((res) => {
+          const out = new Map();
+          try {
+            const t = db.transaction("kline", "readonly"), st = t.objectStore("kline");
+            for (const k of keys) { const r = st.get(k); r.onsuccess = () => { if (r.result) out.set(k, r.result); }; }
+            t.oncomplete = () => res(out);
+            t.onerror = t.onabort = () => res(out);
+          } catch (e) { res(out); }
+        });
+      },
+      putMany: async (entries) => {
+        if (!entries.length) return;
+        await tx("readwrite", (st) => { for (const [k, v] of entries) st.put(v, k); });
+      },
+    };
+  })();
+  const ls = {
+    get(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 存不下就不存 */ } },
+  };
+
   // pandas rank(pct=True) 的平均名次；缺失给 50 分
   function pctRank(vals, higherBetter = true) {
     const idx = vals.map((v, i) => [v, i]).filter(([v]) => isN(v));
@@ -110,6 +163,16 @@
   }
 
   async function fetchFinancials(today) {
+    const cached = ls.get("astock_fin");
+    if (cached && cached.date === today && Array.isArray(cached.rows) && cached.rows.length > 3000) {
+      return new Map(cached.rows.map((r) => [r.code, r]));
+    }
+    const fin = await fetchFinancialsFresh(today);
+    ls.set("astock_fin", { date: today, rows: [...fin.values()] });
+    return fin;
+  }
+
+  async function fetchFinancialsFresh(today) {
     const qs = quarterEnds(today);
     const periods = [await fetchFinPeriod(qs[0])];
     if (periods[0].count < 4500) periods.push(await fetchFinPeriod(qs[1]));
@@ -321,9 +384,11 @@
   function stockRecord(r, t) {
     const [st, ind, twhy] = t;
     const why = [];
-    if (r.roe_annual >= 15) why.push(`ROE ${r.roe_annual.toFixed(0)}%`);
-    if (r.profit_yoy >= 30) why.push(`净利润+${r.profit_yoy.toFixed(0)}%`);
-    if (r.rev_yoy >= 20) why.push(`营收+${r.rev_yoy.toFixed(0)}%`);
+    if (CONFIG.weights.fundamental > 0) {
+      if (r.roe_annual >= 15) why.push(`ROE ${r.roe_annual.toFixed(0)}%`);
+      if (r.profit_yoy >= 30) why.push(`净利润+${r.profit_yoy.toFixed(0)}%`);
+      if (r.rev_yoy >= 20) why.push(`营收+${r.rev_yoy.toFixed(0)}%`);
+    }
     if (r.main_pct > 10) why.push("今日主动买入多");
     why.push(...twhy);
     return {
@@ -339,24 +404,40 @@
     };
   }
 
+  // 用本机缓存的历史 K 线 + 实时行情拼出完整 K 线；对不上（除权除息、缓存过期）就返回 null，改为重新下载
+  const close2 = (a, b) => isN(a) && isN(b) && Math.abs(a - b) <= Math.max(0.011, Math.abs(b) * 0.0005);
+  function barsFromCache(c, r, ltd, prevTd, sessionDone) {
+    if (!c || !Array.isArray(c.bars) || c.bars.length < CONFIG.min_kline_days - 1) return null;
+    const lastBar = c.bars[c.bars.length - 1];
+    const bars = c.bars.map((b) => ({ date: b[0], open: b[1], close: b[2], high: b[3], low: b[4], volume: b[5], amount: b[2] * b[5] * 100 }));
+    if (lastBar[0] === ltd && sessionDone && close2(lastBar[2], r.price)) return bars.slice(-130);
+    if (!(lastBar[0] === prevTd && close2(lastBar[2], r.prev_close))) return null;
+    if (!(r.volume > 0) || !isN(r.open) || !isN(r.high) || !isN(r.low) || !isN(r.price)) return null;
+    bars.push({ date: ltd, open: r.open, close: r.price, high: r.high, low: r.low, volume: r.volume, amount: r.price * r.volume * 100 });
+    return bars.slice(-130);
+  }
+
   // ───────── 主流程 ─────────
   async function run({ onProgress = () => {} } = {}) {
     const t0 = Date.now();
     const now = cnNow();
     const today = now.date;
-    onProgress("正在确认交易日", 2);
-    const tdates = await tradingDates(CONFIG.pattern_days + 1);
+    onProgress("正在获取交易日、财报和涨停股（1/3）", 3);
+    const tdP = tradingDates(CONFIG.pattern_days + 1);
+    const finP = fetchFinancials(today);
+    const ztP = tdP.then((td) => Promise.all(td.slice(-CONFIG.pattern_days).map((d) => fetchZtPool(d).then((m) => ({ d, m }), () => null))));
+    const tdates = await tdP;
     const ltd = tdates[tdates.length - 1];
+    const prevTd = tdates[tdates.length - 2];
     const isTrading = ltd === today;
     const frac = isTrading ? tradingFraction(now.h, now.m) : 1;
+    const sessionDone = !isTrading || now.h * 60 + now.m >= 15 * 60 + 5;  // 当天 K 线是否已收盘定型
     const meta = { version: VERSION, run_at: now.iso, trade_date: ltd || today, is_trading_day: isTrading, local: true };
-
-    onProgress("正在获取财报（1/4）", 5);
-    const fin = await fetchFinancials(today);
+    const fin = await finP;
     const codes = [...fin.values()].filter((f) => !String(f.exchange).includes("北")).map((f) => f.code);
 
-    onProgress("正在获取行情（2/4）", 20);
-    const spot = await fetchSpot(codes, (i, n) => onProgress(`正在获取行情（2/4）${i}/${n}`, 20 + 15 * i / n));
+    onProgress("正在获取实时行情（2/3）", 12);
+    const spot = await fetchSpot(codes, (i, n) => onProgress(`正在获取实时行情（2/3）${i}/${n}`, 12 + 18 * i / n));
     meta.universe = spot.length;
     const up = spot.filter((r) => r.pct > 0).length, down = spot.filter((r) => r.pct < 0).length;
     const market = {
@@ -383,24 +464,24 @@
       r.c_score = 0.7 * cR[0][i] + 0.3 * cR[1][i];
     });
 
-    const [lo, hi] = CONFIG.pe_ttm_range;
+    const pe = CONFIG.pe_ttm_range;
     const strict = base.filter((r) => r.mcap >= CONFIG.min_mcap_yi * 1e8 && r.amount >= CONFIG.min_amount_yi * 1e8 &&
-      r.pe_ttm > lo && r.pe_ttm <= hi && r.roe_annual >= CONFIG.min_roe_annual &&
-      (isN(r.profit_yoy) ? r.profit_yoy : -999) >= CONFIG.min_profit_yoy &&
+      (!pe || (r.pe_ttm > pe[0] && r.pe_ttm <= pe[1])) &&
+      (CONFIG.min_roe_annual == null || r.roe_annual >= CONFIG.min_roe_annual) &&
+      (CONFIG.min_profit_yoy == null || (isN(r.profit_yoy) ? r.profit_yoy : -999) >= CONFIG.min_profit_yoy) &&
       (!CONFIG.exclude_limit || Math.abs(r.pct) < limitPct(r.code) - 0.3));
     meta.after_filter = strict.length;
-    const compCand = new Set(strict.slice().sort((a, b) => (0.5 * b.f_score + 0.5 * b.c_score) - (0.5 * a.f_score + 0.5 * a.c_score))
+    const wf = CONFIG.weights.fundamental;
+    const pre = (r) => wf * r.f_score + (1 - wf) * r.c_score;
+    const compCand = new Set(strict.slice().sort((a, b) => pre(b) - pre(a))
       .slice(0, CONFIG.tech_candidates).map((r) => r.code));
 
-    onProgress("正在获取涨停股（3/4）", 36);
     const patBase = new Set(base.filter((r) => r.mcap >= CONFIG.pattern_min_mcap_yi * 1e8 && r.amount >= CONFIG.pattern_min_amount_yi * 1e8).map((r) => r.code));
     let zt = new Set(), poolOk = true;
-    for (const d of tdates.slice(-CONFIG.pattern_days)) {
-      try {
-        const p = await fetchZtPool(d);
-        p.forEach((_, c) => zt.add(c));
-        if (d === tdates[tdates.length - 1]) market.zt_today = p.size;
-      } catch (e) { poolOk = false; }
+    for (const x of await ztP) {
+      if (!x) { poolOk = false; continue; }
+      x.m.forEach((_, c) => zt.add(c));
+      if (x.d === ltd) market.zt_today = x.m.size;
     }
     if (!poolOk) zt = patBase;
     const patCand = new Set([...zt].filter((c) => patBase.has(c)));
@@ -409,22 +490,35 @@
     const byCode = new Map(base.map((r) => [r.code, r]));
     const need = [...new Set([...compCand, ...patCand])];
     const tech = new Map(), pats = new Map();
-    let done = 0;
+    let done = 0, fromCache = 0;
+    const cache = await idb.getMany(need);
+    const toStore = [];
+    const fromCacheBars = (code, r) => barsFromCache(cache.get(code), r, ltd, prevTd, sessionDone);
     const job = async (code) => {
       const r = byCode.get(code);
       try {
-        const k = await fetchKline(r.mkt, code);
+        let k = fromCacheBars(code, r);
+        if (k) fromCache++;
+        else {
+          k = await fetchKline(r.mkt, code);
+          if (k && k.length) {
+            const keep = k.filter((b) => b.date < today || (b.date === today && sessionDone));
+            toStore.push([code, { saved: now.iso, bars: keep.map((b) => [b.date, b.open, b.close, b.high, b.low, b.volume]) }]);
+          }
+        }
         if (k && k.length >= CONFIG.min_kline_days) {
           tech.set(code, technicals(k, r.vol_ratio));
           if (patCand.has(code)) { const p = detectPatterns(k, code, today, frac); if (p) pats.set(code, p); }
         }
         return null;
       } catch (e) { return code; }
-      finally { onProgress(`正在计算走势（4/4）${++done}/${need.length}`, 40 + 58 * done / need.length); }
+      finally { onProgress(`正在计算走势（3/3）${++done}/${need.length}`, 32 + 66 * done / need.length); }
     };
-    let failed = (await pool(need, 6, job)).filter(Boolean);
+    let failed = (await pool(need, 8, job)).filter(Boolean);
     if (failed.length) { await sleep(3000); done = need.length - failed.length; failed = (await pool(failed, 2, job)).filter(Boolean); }
     meta.kline_failed = failed.length;
+    meta.kline_cached = fromCache;
+    idb.putMany(toStore);
 
     const w = CONFIG.weights;
     const scored = base.filter((r) => tech.has(r.code));
@@ -473,5 +567,5 @@
     };
   }
 
-  window.AStockEngine = { run, VERSION };
+  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, barsFromCache, tradingDates } };
 })();
