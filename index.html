@@ -94,6 +94,11 @@ header{display:flex;flex-direction:column;gap:1.2rem}
 .datesel{display:flex;align-items:center;gap:.6rem;color:var(--muted);font-size:.9rem}
 .datesel select{width:auto;min-width:9.5rem}
 
+.progress{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:1rem 1.4rem;display:flex;flex-direction:column;gap:.55rem}
+.ptrack{height:8px;border-radius:4px;background:var(--sunk);overflow:hidden}
+.ptrack i{display:block;height:100%;width:0;background:var(--ink);border-radius:4px;transition:width .3s ease}
+.ptext{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.2rem 1rem;font-size:.9rem;color:var(--muted)}
+.ptext span:first-child{color:var(--fg);font-weight:600}
 .notice{padding:1rem 1.3rem;border-radius:16px;line-height:1.6}
 .notice.warn{background:var(--warn-bg);color:var(--warn-fg)}
 .notice.err{background:var(--err-bg);color:var(--err-fg)}
@@ -234,7 +239,7 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     <div class="hd-top">
       <div class="brand">
         <h1>A股每日选股</h1>
-        <p>每个交易日下午 2 点自动更新</p>
+        <p>每个交易日下午 2 点自动更新，也可以随时点「立即运行」</p>
       </div>
       <div class="sizer">字号
         <div class="seg" id="sizer" role="group" aria-label="调整字号">
@@ -249,6 +254,11 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
       <label class="datesel" for="date-select">日期
         <select class="input" id="date-select" disabled><option>—</option></select>
       </label>
+      <button class="btn" id="run-now" type="button">立即运行</button>
+    </div>
+    <div class="progress" id="prog" hidden>
+      <div class="ptrack"><i id="prog-bar"></i></div>
+      <div class="ptext"><span id="prog-text">准备中…</span><span>大约 1 分钟，请不要关闭页面</span></div>
     </div>
   </header>
 
@@ -440,7 +450,7 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     if (running) { setStatus("warn", "正在运行", "大约 3 到 5 分钟后自动显示结果"); return; }
     if (!latest) return;
     const t = todayCN();
-    if (latest.trade_date === t) setStatus("ok", `今天 ${timeOf(latest.run_at)} 已更新`, "下一次：下一个交易日下午 2 点");
+    if (latest.trade_date === t) setStatus("ok", `今天 ${timeOf(latest.run_at)} 已更新`, latest.local ? "这台设备上刚运行的结果" : "可随时点「立即运行」获取最新结果");
     else if (statusDoc && statusDoc.status === "closed" && statusDoc.run_at?.slice(0, 10) === t) setStatus("", "今天休市", `显示 ${dateCN(latest.trade_date)} 的结果`);
     else setStatus("warn", `最近更新：${dateCN(latest.trade_date)} ${timeOf(latest.run_at)}`);
   }
@@ -561,8 +571,11 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     if (!order.includes(date)) date = order[0];
     if (!date) return;
     if (!runs.has(date)) {
-      try { runs.set(date, await getJSON(`runs/${date}.json`)); }
-      catch { if (date !== order[0]) return pick(order[0]); return; }
+      let synced = null;
+      try { synced = await getJSON(`runs/${date}.json`); } catch {}
+      const best = preferLocal(date, synced);
+      if (!best) { if (date !== order[0]) return pick(order[0]); return; }
+      runs.set(date, best);
     }
     if (date !== current) open.clear();
     current = date;
@@ -688,7 +701,64 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
   $("alert-more").addEventListener("click", () => { newsFilter = "major"; newsLimit = 20; renderNews(); $("news").scrollIntoView(); });
 
   // ───────── 数据（GitHub Pages 上的静态 JSON，每 3 分钟检查一次更新）─────────
-  function updateRunBtn() {}
+  // ───────── 立即运行：在这台手机/电脑上直接选股 ─────────
+  const LOCAL_KEY = "localRun";
+  let armed = false, armTimer = null, localRunning = false;
+  function loadLocal() { try { return JSON.parse(localStorage.getItem(LOCAL_KEY) || "null"); } catch { return null; } }
+  function saveLocal(r) { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(r)); } catch {} }
+  function preferLocal(date, synced) {
+    const l = loadLocal();
+    return l && l.trade_date === date && (!synced || (l.run_at || "") > (synced.run_at || "")) ? l : synced;
+  }
+  function updateRunBtn() {
+    const b = $("run-now");
+    b.className = "btn" + (armed ? " danger" : "");
+    b.disabled = localRunning;
+    b.textContent = localRunning ? "正在运行…" : armed ? "再点一次开始" : "立即运行";
+  }
+  function loadEngine() {
+    if (window.AStockEngine) return Promise.resolve();
+    return new Promise((res, rej) => {
+      const sc = document.createElement("script");
+      sc.src = "engine.js?v=" + Date.now();
+      sc.onload = () => res(); sc.onerror = () => rej(new Error("程序文件下载失败"));
+      document.head.appendChild(sc);
+    });
+  }
+  async function runLocal() {
+    localRunning = true; armed = false; updateRunBtn();
+    const prog = $("prog"), bar = $("prog-bar"), txt = $("prog-text"), n = $("notice");
+    prog.hidden = false; bar.style.width = "1%"; txt.textContent = "准备中…";
+    n.hidden = true; n.dataset.src = "";
+    try {
+      await loadEngine();
+      const r = await window.AStockEngine.run({ onProgress: (t, pct) => { txt.textContent = t; bar.style.width = Math.max(1, Math.min(100, pct)) + "%"; } });
+      saveLocal(r);
+      runs.set(r.trade_date, r);
+      if (!order.includes(r.trade_date)) { order = [r.trade_date, ...order].sort().reverse(); renderDates(); }
+      current = null;
+      await pick(r.trade_date);
+      n.dataset.src = "run"; n.className = "notice warn"; n.hidden = false;
+      n.textContent = `已在这台设备上运行完成（${timeOf(r.run_at)}，用时 ${Math.round(r.elapsed_s)} 秒），下面是最新结果。`;
+      setTimeout(() => { if (n.dataset.src === "run") { n.hidden = true; n.dataset.src = ""; } }, 60 * 1000);
+    } catch (err) {
+      n.dataset.src = "run"; n.className = "notice err"; n.hidden = false;
+      n.textContent = "这次没有运行成功：" + (err && err.message ? err.message : "网络不稳定") + "。请检查网络后再试一次。";
+    } finally {
+      localRunning = false; prog.hidden = true; updateRunBtn(); renderStatus();
+    }
+  }
+  $("run-now").addEventListener("click", () => {
+    if (localRunning) return;
+    if (!armed) {
+      armed = true; updateRunBtn();
+      clearTimeout(armTimer);
+      armTimer = setTimeout(() => { armed = false; updateRunBtn(); }, 5000);
+      return;
+    }
+    clearTimeout(armTimer);
+    runLocal();
+  });
   async function getJSON(path) {
     const r = await fetch(`data/${path}?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(String(r.status));
@@ -713,7 +783,9 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
       sig = nextSig;
       const wasLatest = !current || current === order[0];
       order = (idx.dates || []).slice().sort().reverse();
-      if (latestChanged) runs.delete(order[0]);
+      const l = loadLocal();
+      if (l && l.trade_date && !order.includes(l.trade_date)) { order = [l.trade_date, ...order].sort().reverse(); runs.set(l.trade_date, l); }
+      if (latestChanged && !(runs.get(order[0]) || {}).local) runs.delete(order[0]);
       renderDates();
       if (!order.length) {
         setStatus("", "还没有选股结果", "交易日下午 2 点运行后自动出现");
@@ -737,7 +809,9 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     statusDoc = b.index.status || null;
     order = (b.index.dates || []).slice().sort().reverse();
     sig = JSON.stringify([b.index.dates, b.index.runs_updated_at]);
-    if (b.run && b.run.trade_date) runs.set(b.run.trade_date, b.run);
+    if (b.run && b.run.trade_date) runs.set(b.run.trade_date, preferLocal(b.run.trade_date, b.run));
+    const l = loadLocal();
+    if (l && l.trade_date && !order.includes(l.trade_date)) { order = [l.trade_date, ...order].sort().reverse(); runs.set(l.trade_date, l); }
     renderDates();
     if (order.length) {
       const h = hashDate();

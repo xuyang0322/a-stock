@@ -1,0 +1,477 @@
+/*
+ * A股每日选股 · 浏览器版选股引擎
+ * 与 screener.py v2.0-tx 同一套规则，在看网页的人自己的手机/电脑上运行。
+ * 数据：腾讯行情 qt.gtimg.cn、腾讯日K web.ifzq.gtimg.cn、东方财富财报 datacenter-web、涨停池 push2ex（都允许网页直接访问）。
+ * 用法：const result = await AStockEngine.run({ onProgress: (text, pct) => {} });
+ */
+(function () {
+  "use strict";
+  const VERSION = "2.0-tx-web";
+  const CONFIG = {
+    top_n: 30, tech_candidates: 300,
+    exclude_st: true, exclude_limit: true,
+    min_mcap_yi: 50, min_amount_yi: 0, pe_ttm_range: [0, 100],
+    min_roe_annual: 6.0, min_profit_yoy: -30.0, min_kline_days: 120,
+    weights: { fundamental: 0.35, capital: 0.30, technical: 0.35 },
+    pattern_days: 5, pattern_min_mcap_yi: 50, pattern_min_amount_yi: 0,
+    pullback_range: [-2.0, 0.0], pattern_max_list: 50,
+  };
+
+  // ───────── 工具 ─────────
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const num = (x) => {
+    if (x === null || x === undefined || x === "-" || x === "") return NaN;
+    const v = Number(x);
+    return Number.isFinite(v) ? v : NaN;
+  };
+  const isN = (v) => typeof v === "number" && Number.isFinite(v);
+  const rn = (x, d = 2) => (isN(x) ? Math.round(x * 10 ** d) / 10 ** d : null);
+  const sign = (x) => (x > 0 ? 1 : x < 0 ? -1 : 0);
+
+  function cnNow() {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }).formatToParts(new Date()).map((x) => [x.type, x.value]));
+    const date = `${p.year}-${p.month}-${p.day}`;
+    return { date, iso: `${date}T${p.hour}:${p.minute}:${p.second}+08:00`, h: +p.hour, m: +p.minute };
+  }
+
+  async function fetchRetry(url, { tries = 4, timeout = 15000, as = "json" } = {}) {
+    let last;
+    for (let i = 0; i < tries; i++) {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), timeout);
+      try {
+        const r = await fetch(url, { signal: ctl.signal, cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        if (as === "gbk") return new TextDecoder("gbk").decode(await r.arrayBuffer());
+        return as === "text" ? await r.text() : await r.json();
+      } catch (e) {
+        last = e;
+        await sleep(800 * (i + 1));
+      } finally {
+        clearTimeout(t);
+      }
+    }
+    throw new Error(`请求失败：${url.split("?")[0]}（${last && last.message}）`);
+  }
+
+  async function pool(items, workers, fn) {
+    const out = new Array(items.length);
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(workers, items.length) }, async () => {
+      while (i < items.length) {
+        const k = i++;
+        out[k] = await fn(items[k], k);
+      }
+    }));
+    return out;
+  }
+
+  // pandas rank(pct=True) 的平均名次；缺失给 50 分
+  function pctRank(vals, higherBetter = true) {
+    const idx = vals.map((v, i) => [v, i]).filter(([v]) => isN(v));
+    idx.sort((a, b) => (higherBetter ? a[0] - b[0] : b[0] - a[0]));
+    const n = idx.length, out = vals.map(() => 50);
+    for (let s = 0; s < n;) {
+      let e = s;
+      while (e + 1 < n && idx[e + 1][0] === idx[s][0]) e++;
+      const avg = (s + e) / 2 + 1;
+      for (let j = s; j <= e; j++) out[idx[j][1]] = (avg / n) * 100;
+      s = e + 1;
+    }
+    return out;
+  }
+
+  const limitPct = (code) => (/^(300|301|688|689)/.test(code) ? 20 : 10);
+  const txSym = (code) => (/^(60|68)/.test(code) ? "sh" + code : /^(00|30)/.test(code) ? "sz" + code : null);
+
+  // ───────── 数据 ─────────
+  function quarterEnds(todayStr) {
+    const y = +todayStr.slice(0, 4);
+    const c = [];
+    for (const yy of [y, y - 1, y - 2]) for (const [m, d] of [[3, 31], [6, 30], [9, 30], [12, 31]]) c.push(`${yy}-${String(m).padStart(2, "0")}-${d}`);
+    return c.filter((d) => d < todayStr).sort().reverse();
+  }
+
+  async function fetchFinPeriod(ds) {
+    const base = "https://datacenter-web.eastmoney.com/api/data/v1/get?sortColumns=SECURITY_CODE&sortTypes=1&pageSize=500&reportName=RPT_LICO_FN_CPD" +
+      "&columns=SECURITY_CODE,SECURITY_NAME_ABBR,TRADE_MARKET,PUBLISHNAME,REPORTDATE,WEIGHTAVG_ROE,YSTZ,SJLTZ,XSMLL" +
+      `&filter=${encodeURIComponent(`(REPORTDATE='${ds}')`)}`;
+    const first = await fetchRetry(base + "&pageNumber=1");
+    const res = first.result || {};
+    const pages = +res.pages || 0;
+    const rows = [...(res.data || [])];
+    const rest = await pool(Array.from({ length: Math.max(0, pages - 1) }, (_, i) => i + 2), 6,
+      (pn) => fetchRetry(base + "&pageNumber=" + pn).then((j) => (j.result && j.result.data) || []));
+    rest.forEach((r) => rows.push(...r));
+    return { rows, count: +res.count || rows.length, month: +ds.slice(5, 7) };
+  }
+
+  async function fetchFinancials(today) {
+    const qs = quarterEnds(today);
+    const periods = [await fetchFinPeriod(qs[0])];
+    if (periods[0].count < 4500) periods.push(await fetchFinPeriod(qs[1]));
+    const fin = new Map();
+    for (const { rows, month } of periods) {
+      for (const r of rows) {
+        const code = String(r.SECURITY_CODE).padStart(6, "0");
+        const rd = String(r.REPORTDATE).slice(0, 10);
+        const old = fin.get(code);
+        if (old && old.report_date >= rd) continue;
+        const roe = num(r.WEIGHTAVG_ROE);
+        fin.set(code, {
+          code, report_date: rd, roe, roe_annual: roe * 12 / month,
+          rev_yoy: num(r.YSTZ), profit_yoy: num(r.SJLTZ), gross_margin: num(r.XSMLL),
+          industry: r.PUBLISHNAME || "", exchange: r.TRADE_MARKET || "", fin_name: r.SECURITY_NAME_ABBR || "",
+        });
+      }
+    }
+    return fin;
+  }
+
+  const TX = { name: 1, code: 2, price: 3, prev_close: 4, open: 5, volume: 6, outer: 7, inner: 8, pct: 32, high: 33, low: 34,
+    amount_wan: 37, turnover: 38, pe_ttm: 39, float_mcap_yi: 44, mcap_yi: 45, pb: 46, vol_ratio: 49 };
+
+  async function fetchSpot(codes, onBatch) {
+    const syms = codes.map(txSym).filter(Boolean);
+    const batches = [];
+    for (let i = 0; i < syms.length; i += 300) batches.push(syms.slice(i, i + 300));
+    let done = 0;
+    const texts = await pool(batches, 4, async (b) => {
+      const t = await fetchRetry("https://qt.gtimg.cn/q=" + b.join(","), { as: "gbk" });
+      onBatch && onBatch(++done, batches.length);
+      return t;
+    });
+    const rows = [];
+    for (const text of texts) {
+      for (const line of text.split(";")) {
+        const at = line.indexOf('="');
+        if (at < 0) continue;
+        const f = line.slice(at + 2).replace(/"\s*$/, "").trim().split("~");
+        if (f.length <= 49) continue;
+        const r = {};
+        for (const [k, i] of Object.entries(TX)) r[k] = f[i];
+        r.name = String(r.name).replace(/\s+/g, "");
+        for (const k of Object.keys(TX)) if (k !== "code" && k !== "name") r[k] = num(r[k]);
+        r.code = String(r.code).padStart(6, "0");
+        r.mkt = r.code.startsWith("6") ? 1 : 0;
+        if (/^(688|689)/.test(r.code)) { r.volume /= 100; r.outer /= 100; r.inner /= 100; }
+        r.amount = r.amount_wan * 1e4;
+        r.mcap = r.mcap_yi * 1e8;
+        r.main_pct = r.volume > 0 ? (r.outer - r.inner) / r.volume * 100 : NaN;
+        r.main_net = (r.outer - r.inner) * 100 * r.price;
+        if (!(r.price > 0)) r.price = NaN;
+        rows.push(r);
+      }
+    }
+    const seen = new Set();
+    return rows.filter((r) => (seen.has(r.code) ? false : (seen.add(r.code), true)));
+  }
+
+  async function fetchKline(mkt, code, lmt = 130) {
+    const sym = (+mkt === 1 ? "sh" : "sz") + code;
+    const j = await fetchRetry(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${sym},day,,,${lmt},qfq`, { tries: 5, timeout: 10000 });
+    const d = (j.data && j.data[sym]) || {};
+    const kl = d.qfqday || d.day || [];
+    if (!kl.length) return null;
+    const star = /^(688|689)/.test(code) && code !== "000001";
+    return kl.map((k) => {
+      const v = num(k[5]) / (star ? 100 : 1);
+      const close = num(k[2]);
+      return { date: k[0], open: num(k[1]), close, high: num(k[3]), low: num(k[4]), volume: v, amount: close * v * 100 };
+    });
+  }
+
+  async function tradingDates(n = 6) {
+    try {
+      const k = await fetchKline(1, "000001", n);
+      if (k && k.length) return k.map((x) => x.date);
+    } catch (e) { /* 兜底见下 */ }
+    const t = await fetchRetry("https://qt.gtimg.cn/q=sh000001", { as: "gbk" });
+    const f = t.split("~");
+    const s = f[30].slice(0, 8);
+    let d = new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T12:00:00+08:00`);
+    const out = [d.toISOString().slice(0, 10)];
+    while (out.length < n) {
+      d = new Date(d.getTime() - 86400000);
+      const wd = d.getUTCDay();
+      if (wd !== 0 && wd !== 6) out.push(d.toISOString().slice(0, 10));
+    }
+    return out.sort();
+  }
+
+  async function fetchZtPool(day) {
+    const j = await fetchRetry("https://push2ex.eastmoney.com/getTopicZTPool?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0&pagesize=10000&sort=fbt:asc&date=" + day.replace(/-/g, ""), { tries: 3 });
+    const m = new Map();
+    for (const p of ((j.data && j.data.pool) || [])) if (p.c) m.set(String(p.c).padStart(6, "0"), +p.lbc || 1);
+    return m;
+  }
+
+  function tradingFraction(h, m) {
+    const t = h * 60 + m;
+    const am = Math.max(0, Math.min(t, 11 * 60 + 30) - (9 * 60 + 30));
+    const pm = Math.max(0, Math.min(t, 15 * 60) - 13 * 60);
+    return Math.max((am + pm) / 240, 0.05);
+  }
+
+  // ───────── 指标 ─────────
+  function rolling(a, w) { return a.map((_, i) => (i + 1 < w ? NaN : a.slice(i + 1 - w, i + 1).reduce((s, x) => s + x, 0) / w)); }
+  function ewm(a, alpha) {
+    const out = new Array(a.length).fill(NaN);
+    let prev = NaN;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i];
+      if (!isN(x)) { out[i] = prev; continue; }
+      prev = isN(prev) ? alpha * x + (1 - alpha) * prev : x;
+      out[i] = prev;
+    }
+    return out;
+  }
+  const at = (a, i) => a[a.length + i];
+
+  function technicals(k, vr) {
+    const c = k.map((x) => x.close);
+    const ma20 = rolling(c, 20), ma60 = rolling(c, 60);
+    const ema12 = ewm(c, 2 / 13), ema26 = ewm(c, 2 / 27);
+    const dif = c.map((_, i) => ema12[i] - ema26[i]);
+    const dea = ewm(dif, 2 / 10);
+    const delta = c.map((x, i) => (i ? x - c[i - 1] : NaN));
+    const gain = ewm(delta.map((x) => (isN(x) ? Math.max(x, 0) : NaN)), 1 / 14);
+    const loss = ewm(delta.map((x) => (isN(x) ? Math.max(-x, 0) : NaN)), 1 / 14);
+    const rsiLast = at(loss, -1) === 0 || !isN(at(loss, -1)) ? NaN : 100 - 100 / (1 + at(gain, -1) / at(loss, -1));
+
+    const last = at(c, -1), m20 = at(ma20, -1), m60 = at(ma60, -1), m20p = at(ma20, -6);
+    const d = at(dif, -1), e = at(dea, -1);
+    const r = isN(rsiLast) ? rsiLast : 50;
+    const highs = k.slice(-61, -1).map((x) => x.high);
+    const hi60 = highs.length ? Math.max(...highs) : NaN;
+    const chg20 = (last / at(c, -21) - 1) * 100;
+    let cross = false;
+    for (let i = 1; i <= 3; i++) if (at(dif, -i) > at(dea, -i) && at(dif, -i - 1) <= at(dea, -i - 1)) cross = true;
+
+    let s = 0; const why = [];
+    if (last > m20) s += 12;
+    if (m20 > m60) s += 13;
+    if (m20 > m20p) s += 10;
+    if (last > m20 && m20 > m60 && m20 > m20p) why.push("均线多头");
+    if (d > e) s += 12;
+    if (d > 0) s += 6;
+    if (cross) { s += 7; why.push("MACD金叉"); }
+    if (r >= 50 && r <= 70) s += 15;
+    else if ((r >= 45 && r < 50) || (r > 70 && r <= 78)) s += 8;
+    else if (r > 85) s -= 5;
+    if (isN(hi60) && hi60 > 0) {
+      const gap = (last / hi60 - 1) * 100;
+      if (gap >= 0) { s += 15; why.push("创60日新高"); }
+      else if (gap >= -3) { s += 10; why.push("逼近60日新高"); }
+      else if (gap >= -8) s += 5;
+    }
+    if (isN(vr)) {
+      if (vr >= 1.2 && vr <= 3) { s += 10; why.push(`温和放量(量比${vr.toFixed(1)})`); }
+      else if ((vr >= 1 && vr < 1.2) || (vr > 3 && vr <= 5)) s += 5;
+    }
+    if (chg20 > 40) { s -= 15; why.push("短期涨幅过大"); }
+
+    const k5 = k.slice(-5);
+    const sg = k5.map((x, i) => sign(i ? x.close - k5[i - 1].close : (c.length > 5 ? x.close - at(c, -6) : 0)));
+    const amt5 = k5.reduce((a, x) => a + x.amount, 0);
+    const net5 = k5.reduce((a, x, i) => a + sg[i] * x.amount, 0);
+    const flow5 = amt5 > 0 ? net5 / amt5 * 100 : NaN;
+    if (isN(flow5) && flow5 >= 20) why.push("近5日资金流入");
+    const ind = {
+      main_pct_5d: rn(flow5, 1), main_net_5d_wan: Math.round(net5 / 1e4),
+      ma20: rn(m20), ma60: rn(m60), rsi: rn(r, 1), macd: d > e ? "金叉" : "死叉",
+      chg20: rn(chg20, 1), dist_hi60: hi60 ? rn((last / hi60 - 1) * 100, 1) : null,
+    };
+    return [Math.max(0, Math.min(100, s)), ind, why];
+  }
+
+  function detectPatterns(k, code, today, frac) {
+    const n = CONFIG.pattern_days;
+    if (!k || k.length < n + 2) return null;
+    const lim = limitPct(code) - 0.3;
+    const c = k.map((x) => x.close), v = k.map((x) => x.volume);
+    const pct = c.map((x, i) => (i ? (x / c[i - 1] - 1) * 100 : NaN));
+    if (k[k.length - 1].date === today && frac < 1) v[v.length - 1] = v[v.length - 1] / frac;
+    const zt = [];
+    for (let i = k.length - n; i < k.length; i++) if (pct[i] >= lim) zt.push(i);
+    if (!zt.length) return null;
+    const lastZ = zt[zt.length - 1];
+    let lb = 0, j = lastZ;
+    while (j > 0 && pct[j] >= lim) { lb++; j--; }
+    const chgN = (at(c, -1) / c[k.length - n - 1] - 1) * 100;
+    const out = { zt_count: zt.length, zt_last: k[lastZ].date, zt_streak: lb, chg_n: rn(chgN, 1),
+      today_zt: at(pct, -1) >= lim, strong: chgN > 0, pullback: false };
+    const after = [];
+    for (let i = lastZ + 1; i < k.length; i++) after.push(i);
+    if (after.length) {
+      const bc = c[lastZ], bv = v[lastZ];
+      const rel = after.map((i) => (c[i] / bc - 1) * 100);
+      const [lo, hi] = CONFIG.pullback_range;
+      const shrink = bv > 0 ? Math.max(...after.map((i) => v[i])) / bv : NaN;
+      const ok = Math.min(...rel) >= lo && at(rel, -1) <= hi && Math.max(...rel) <= hi + 1e-9 && shrink < 1;
+      Object.assign(out, { pullback: !!ok, pullback_pct: rn(at(rel, -1), 2), pullback_min: rn(Math.min(...rel), 2),
+        vol_shrink: isN(shrink) ? rn(shrink, 2) : null, days_since_zt: after.length });
+    }
+    return out;
+  }
+
+  function stockRecord(r, t) {
+    const [st, ind, twhy] = t;
+    const why = [];
+    if (r.roe_annual >= 15) why.push(`ROE ${r.roe_annual.toFixed(0)}%`);
+    if (r.profit_yoy >= 30) why.push(`净利润+${r.profit_yoy.toFixed(0)}%`);
+    if (r.rev_yoy >= 20) why.push(`营收+${r.rev_yoy.toFixed(0)}%`);
+    if (r.main_pct > 10) why.push("今日主动买入多");
+    why.push(...twhy);
+    return {
+      code: r.code, name: r.name, industry: r.industry || "", market: r.mkt === 1 ? "SH" : "SZ",
+      price: rn(r.price), pct: rn(r.pct), score: rn(r.score, 1),
+      f_score: rn(r.f_score, 1), c_score: rn(r.c_score, 1), t_score: rn(st, 1),
+      mcap_yi: rn(r.mcap / 1e8, 0), amount_yi: rn(r.amount / 1e8, 1),
+      pe_ttm: rn(r.pe_ttm, 1), pb: rn(r.pb), turnover: rn(r.turnover),
+      roe_annual: rn(r.roe_annual, 1), rev_yoy: rn(r.rev_yoy, 1), profit_yoy: rn(r.profit_yoy, 1), gross_margin: rn(r.gross_margin, 1),
+      report_date: r.report_date || null,
+      main_net_wan: rn(r.main_net / 1e4, 0), main_pct: rn(r.main_pct),
+      vol_ratio: rn(r.vol_ratio), ...ind, reasons: why,
+    };
+  }
+
+  // ───────── 主流程 ─────────
+  async function run({ onProgress = () => {} } = {}) {
+    const t0 = Date.now();
+    const now = cnNow();
+    const today = now.date;
+    onProgress("正在确认交易日", 2);
+    const tdates = await tradingDates(CONFIG.pattern_days + 1);
+    const ltd = tdates[tdates.length - 1];
+    const isTrading = ltd === today;
+    const frac = isTrading ? tradingFraction(now.h, now.m) : 1;
+    const meta = { version: VERSION, run_at: now.iso, trade_date: ltd || today, is_trading_day: isTrading, local: true };
+
+    onProgress("正在获取财报（1/4）", 5);
+    const fin = await fetchFinancials(today);
+    const codes = [...fin.values()].filter((f) => !String(f.exchange).includes("北")).map((f) => f.code);
+
+    onProgress("正在获取行情（2/4）", 20);
+    const spot = await fetchSpot(codes, (i, n) => onProgress(`正在获取行情（2/4）${i}/${n}`, 20 + 15 * i / n));
+    meta.universe = spot.length;
+    const up = spot.filter((r) => r.pct > 0).length, down = spot.filter((r) => r.pct < 0).length;
+    const market = {
+      up, down, flat: spot.length - up - down,
+      main_net_yi: rn(spot.reduce((a, r) => a + (isN(r.main_net) ? r.main_net : 0), 0) / 1e8, 1),
+      amount_yi: Math.round(spot.reduce((a, r) => a + (isN(r.amount) ? r.amount : 0), 0) / 1e8),
+      flow_basis: "主动买卖（外盘-内盘）",
+    };
+
+    const df = spot.map((s) => {
+      const f = fin.get(s.code) || {};
+      return { ...f, ...s, name: s.name || f.fin_name, industry: f.industry || "", report_date: f.report_date };
+    });
+    const minM = Math.min(CONFIG.min_mcap_yi, CONFIG.pattern_min_mcap_yi) * 1e8;
+    const minA = Math.min(CONFIG.min_amount_yi, CONFIG.pattern_min_amount_yi) * 1e8;
+    const base = df.filter((r) => r.price > 0 && !(CONFIG.exclude_st && /ST|退/.test(r.name || "")) &&
+      r.mcap >= minM && r.amount > 0 && r.amount >= minA);
+
+    const fR = [pctRank(base.map((r) => r.roe_annual)), pctRank(base.map((r) => r.rev_yoy)), pctRank(base.map((r) => r.profit_yoy)),
+      pctRank(base.map((r) => r.gross_margin)), pctRank(base.map((r) => (r.pe_ttm > 0 ? r.pe_ttm : NaN)), false)];
+    const cR = [pctRank(base.map((r) => r.main_pct)), pctRank(base.map((r) => (isN(r.vol_ratio) ? Math.min(r.vol_ratio, 3) : NaN)))];
+    base.forEach((r, i) => {
+      r.f_score = 0.30 * fR[0][i] + 0.20 * fR[1][i] + 0.25 * fR[2][i] + 0.10 * fR[3][i] + 0.15 * fR[4][i];
+      r.c_score = 0.7 * cR[0][i] + 0.3 * cR[1][i];
+    });
+
+    const [lo, hi] = CONFIG.pe_ttm_range;
+    const strict = base.filter((r) => r.mcap >= CONFIG.min_mcap_yi * 1e8 && r.amount >= CONFIG.min_amount_yi * 1e8 &&
+      r.pe_ttm > lo && r.pe_ttm <= hi && r.roe_annual >= CONFIG.min_roe_annual &&
+      (isN(r.profit_yoy) ? r.profit_yoy : -999) >= CONFIG.min_profit_yoy &&
+      (!CONFIG.exclude_limit || Math.abs(r.pct) < limitPct(r.code) - 0.3));
+    meta.after_filter = strict.length;
+    const compCand = new Set(strict.slice().sort((a, b) => (0.5 * b.f_score + 0.5 * b.c_score) - (0.5 * a.f_score + 0.5 * a.c_score))
+      .slice(0, CONFIG.tech_candidates).map((r) => r.code));
+
+    onProgress("正在获取涨停股（3/4）", 36);
+    const patBase = new Set(base.filter((r) => r.mcap >= CONFIG.pattern_min_mcap_yi * 1e8 && r.amount >= CONFIG.pattern_min_amount_yi * 1e8).map((r) => r.code));
+    let zt = new Set(), poolOk = true;
+    for (const d of tdates.slice(-CONFIG.pattern_days)) {
+      try {
+        const p = await fetchZtPool(d);
+        p.forEach((_, c) => zt.add(c));
+        if (d === tdates[tdates.length - 1]) market.zt_today = p.size;
+      } catch (e) { poolOk = false; }
+    }
+    if (!poolOk) zt = patBase;
+    const patCand = new Set([...zt].filter((c) => patBase.has(c)));
+    meta.zt_pool = poolOk ? zt.size : null;
+
+    const byCode = new Map(base.map((r) => [r.code, r]));
+    const need = [...new Set([...compCand, ...patCand])];
+    const tech = new Map(), pats = new Map();
+    let done = 0;
+    const job = async (code) => {
+      const r = byCode.get(code);
+      try {
+        const k = await fetchKline(r.mkt, code);
+        if (k && k.length >= CONFIG.min_kline_days) {
+          tech.set(code, technicals(k, r.vol_ratio));
+          if (patCand.has(code)) { const p = detectPatterns(k, code, today, frac); if (p) pats.set(code, p); }
+        }
+        return null;
+      } catch (e) { return code; }
+      finally { onProgress(`正在计算走势（4/4）${++done}/${need.length}`, 40 + 58 * done / need.length); }
+    };
+    let failed = (await pool(need, 6, job)).filter(Boolean);
+    if (failed.length) { await sleep(3000); done = need.length - failed.length; failed = (await pool(failed, 2, job)).filter(Boolean); }
+    meta.kline_failed = failed.length;
+
+    const w = CONFIG.weights;
+    const scored = base.filter((r) => tech.has(r.code));
+    scored.forEach((r) => { r.t_score = tech.get(r.code)[0]; r.score = w.fundamental * r.f_score + w.capital * r.c_score + w.technical * r.t_score; });
+
+    const comp = scored.filter((r) => compCand.has(r.code)).sort((a, b) => b.score - a.score).slice(0, CONFIG.top_n);
+    const picks = comp.map((r, i) => {
+      const rec = stockRecord(r, tech.get(r.code));
+      const p = pats.get(r.code);
+      if (p && p.pullback) rec.reasons.unshift("涨停缩量回调");
+      else if (p && p.strong) rec.reasons.unshift(`近${CONFIG.pattern_days}日涨停`);
+      rec.reasons = rec.reasons.slice(0, 6);
+      return { rank: i + 1, ...rec };
+    });
+    meta.tech_scored = scored.filter((r) => compCand.has(r.code)).length;
+
+    const scoredMap = new Map(scored.map((r) => [r.code, r]));
+    const patternList = (key, cmp) => {
+      const out = [];
+      for (const [code, p] of pats) {
+        if (!p[key] || !scoredMap.has(code)) continue;
+        const rec = stockRecord(scoredMap.get(code), tech.get(code));
+        const tags = [p.zt_count > 1 ? `${p.zt_count}次涨停` : "1次涨停"];
+        if (p.zt_streak >= 2) tags.push(`${p.zt_streak}连板`);
+        if (p.today_zt) tags.push("今日涨停");
+        if (key === "pullback") { tags.push(`回调${p.pullback_pct >= 0 ? "+" : ""}${p.pullback_pct.toFixed(1)}%`); tags.push(`缩量至${Math.round(p.vol_shrink * 100)}%`); }
+        rec.reasons = [...tags, ...rec.reasons].slice(0, 6);
+        for (const k of ["zt_count", "zt_last", "zt_streak", "chg_n", "today_zt", "pullback_pct", "pullback_min", "vol_shrink", "days_since_zt"]) rec[k] = p[k] ?? null;
+        out.push(rec);
+      }
+      out.sort(cmp);
+      return out.slice(0, CONFIG.pattern_max_list).map((r, i) => ({ ...r, rank: i + 1 }));
+    };
+    const strong = patternList("strong", (a, b) => (b.zt_count - a.zt_count) || ((b.chg_n || 0) - (a.chg_n || 0)));
+    const pullback = patternList("pullback", (a, b) => (b.score || 0) - (a.score || 0));
+
+    const indCount = new Map();
+    picks.forEach((p) => p.industry && indCount.set(p.industry, (indCount.get(p.industry) || 0) + 1));
+    meta.elapsed_s = Math.round((Date.now() - t0) / 100) / 10;
+    meta.diag = { zt_pool_ok: poolOk, fin_coverage: rn(df.filter((r) => isN(r.roe_annual)).length / (df.length || 1), 2) };
+    onProgress("完成", 100);
+    return {
+      ...meta, status: "ok", market, picks, strong, pullback,
+      top_industries: [...indCount].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count })),
+      config: CONFIG,
+    };
+  }
+
+  window.AStockEngine = { run, VERSION };
+})();
