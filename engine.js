@@ -6,7 +6,7 @@
  */
 (function () {
   "use strict";
-  const VERSION = "2.2-tx-web";
+  const VERSION = "2.3-tx-web";
   const CONFIG = {
     top_n: 30, tech_candidates: 300,
     exclude_st: true, exclude_limit: true,
@@ -15,6 +15,7 @@
     weights: { fundamental: 0.0, capital: 0.45, technical: 0.55 },
     pattern_days: 5, pattern_min_mcap_yi: 50, pattern_min_amount_yi: 0,
     pullback_range: [-2.0, 0.0], pattern_max_list: 50,
+    setup_lookback: 25, setup_min_amp: 0.15, setup_pull_days: [3, 20], setup_retrace: [0.3, 1.15], setup_max_list: 40,
   };
 
   // ───────── 工具 ─────────
@@ -268,7 +269,7 @@
   async function fetchZtPool(day) {
     const j = await fetchRetry("https://push2ex.eastmoney.com/getTopicZTPool?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0&pagesize=10000&sort=fbt:asc&date=" + day.replace(/-/g, ""), { tries: 3 });
     const m = new Map();
-    for (const p of ((j.data && j.data.pool) || [])) if (p.c) m.set(String(p.c).padStart(6, "0"), +p.lbc || 1);
+    for (const p of ((j.data && j.data.pool) || [])) if (p.c) m.set(String(p.c).padStart(6, "0"), { lbc: +p.lbc || 1, p: rn((+p.p || 0) / 1000), pct: rn(+p.zdp, 1) });
     return m;
   }
 
@@ -417,6 +418,150 @@
     return bars.slice(-130);
   }
 
+  function tdCounts(c) {
+    let buy = 0, sell = 0, i = c.length - 1;
+    while (i >= 4 && c[i] < c[i - 4]) { buy++; i--; }
+    i = c.length - 1;
+    while (i >= 4 && c[i] > c[i - 4]) { sell++; i--; }
+    return [buy, sell];
+  }
+  const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : NaN);
+
+  // 回调蓄势：先有放量大涨（第一个箭头），之后缩量回调到位、未破位（第二个箭头）
+  function detectSetup(k, code, today, frac) {
+    const n = k ? k.length : 0;
+    if (n < 40) return null;
+    const lim = limitPct(code);
+    const c = k.map((x) => x.close), o = k.map((x) => x.open), h = k.map((x) => x.high), lo = k.map((x) => x.low), v = k.map((x) => x.volume);
+    if (k[n - 1].date === today && frac < 1) v[n - 1] = v[n - 1] / frac;
+    const pct = c.map((x, i) => (i ? (x / c[i - 1] - 1) * 100 : NaN));
+    const last = n - 1;
+    const loI = Math.max(1, n - CONFIG.setup_lookback - 1), hiI = n - 3;
+    if (hiI <= loI) return null;
+    let iH = loI;
+    for (let i = loI; i <= hiI; i++) if (c[i] > c[iH]) iH = i;
+    const H = Math.max(...h.slice(Math.max(0, iH - 1), iH + 2));
+    const j0 = Math.max(1, iH - 12);
+    let iL = j0;
+    for (let i = j0; i <= iH; i++) if (lo[i] < lo[iL]) iL = i;
+    const L0 = lo[iL];
+    if (H <= L0 || iL < 21) return null;
+    const amp = H / L0 - 1;
+    if (amp < CONFIG.setup_min_amp) return null;
+    const bigThr = Math.max(6, 0.5 * lim);
+    const big = [];
+    for (let i = iL; i <= iH; i++) {
+      const avg20 = mean(v.slice(i - 20, i));
+      const vr = avg20 > 0 ? v[i] / avg20 : 0;
+      if ((pct[i] >= bigThr && vr >= 2) || pct[i] >= lim - 0.3) big.push([i, pct[i], vr]);
+    }
+    if (!big.length) return null;
+    const Vs = Math.max(...v.slice(iL, iH + 1));
+    const days = last - iH;
+    if (days < CONFIG.setup_pull_days[0] || days > CONFIG.setup_pull_days[1]) return null;
+    const C = c[last];
+    const r = (H - C) / (H - L0);
+    const PL = Math.min(...lo.slice(iH + 1, last + 1));
+    if (r < CONFIG.setup_retrace[0] || r > CONFIG.setup_retrace[1] || PL < 0.96 * L0) return null;
+    const worst = Math.min(...pct.slice(iH + 1, last + 1));
+    if (worst <= -0.6 * lim) return null;
+    if (C > 0.93 * H || pct[last] >= bigThr) return null;
+    const Vt = v[last];
+    const prev3 = mean(v.slice(last - 3, last));
+    const prev5 = last - 1 >= iH + 1 ? mean(v.slice(Math.max(iH + 1, last - 5), last)) : prev3;
+    const shrink = Vs > 0 ? Vt / Vs : 1;
+    const ma = (w) => (last - w + 1 >= 0 ? mean(c.slice(last - w + 1, last + 1)) : NaN);
+    const m5 = ma(5), m10 = ma(10), m20 = ma(20), m60 = ma(60);
+    const d20 = C / m20 - 1, d60 = isN(m60) ? C / m60 - 1 : NaN;
+    if (isN(m60) && C < 0.9 * m60) return null;
+    const near = Math.min(Math.abs(d20), isN(d60) ? Math.abs(d60) : 9) <= 0.04;
+    const mas = [m5, m10, m20, m60].filter(isN);
+    const spread = (Math.max(...mas) - Math.min(...mas)) / C;
+    const m60Prev = last - 64 >= 0 ? mean(c.slice(last - 64, last - 4)) : m60;
+    const m60Up = isN(m60) && m60 >= m60Prev;
+    if (!(r >= 0.5 || near)) return null;
+    let sig = null;
+    if (c[last] > o[last] && pct[last] >= 1.5 && Vt >= 1.3 * prev3 && shrink <= 0.9) sig = "企稳回升";
+    else if (Math.abs(pct[last]) <= 0.4 * lim && shrink <= 0.6 && Vt <= 0.75 * prev5) sig = "缩量到位";
+    if (!sig) return null;
+    const [bi, bpct, bvr] = big.reduce((a, b) => (b[1] > a[1] ? b : a));
+    let score = Math.min(amp / 0.3, 1) * 20 + (bvr >= 3 ? 5 : 0);
+    score += (1 - Math.min(shrink, 1)) * 25;
+    score += r >= 0.5 && r <= 0.9 ? 15 : 8;
+    score += near ? 10 : 0;
+    score += spread <= 0.06 ? 5 : 0;
+    score += m60Up ? 5 : 0;
+    score += sig === "企稳回升" ? 15 : 8;
+    score += worst > -0.4 * lim ? 5 : 0;
+    const [tdb, tds] = tdCounts(c);
+    const why = [sig, `回调第${days}天`, `缩量至${Math.round(shrink * 100)}%`];
+    if (near) why.push("回到均线支撑");
+    if (spread <= 0.06) why.push("均线粘合");
+    if (tdb >= 7) why.push(`九转买${tdb}`);
+    return {
+      setup: true, setup_score: rn(Math.min(score, 100), 1), setup_sig: sig, setup_why: why,
+      surge_date: k[bi].date, surge_pct: rn(bpct, 1), surge_vr: rn(bvr, 1),
+      surge_amp: rn(amp * 100, 1), surge_high: rn(H), surge_low: rn(L0),
+      pull_days: days, retrace: Math.round(r * 100), dist_high: rn((C / H - 1) * 100, 1),
+      pull_low: rn(PL), worst_day: rn(worst, 1), vol_shrink_s: rn(shrink), vol_vs_prev3: prev3 > 0 ? rn(Vt / prev3) : null,
+      dist_ma20: rn(d20 * 100, 1), dist_ma60: isN(d60) ? rn(d60 * 100, 1) : null,
+      ma_spread: rn(spread * 100, 1), ma60_up: !!m60Up, td_buy: tdb, td_sell: tds,
+    };
+  }
+
+  // ───────── 放量大涨记录（第一个箭头的名单）：页面数据文件 + 本机保存 ─────────
+  const REG_KEY = "astock_surges";
+  async function loadRegistry() {
+    let remote = null, local = null;
+    try {
+      const r = await fetch("data/surges.json?t=" + Date.now(), { cache: "no-store" });
+      if (r.ok) remote = await r.json();
+    } catch (e) { /* 没有就用本机的 */ }
+    local = ls.get(REG_KEY);
+    const items = new Map();
+    for (const src of [remote, local]) for (const x of ((src && src.items) || [])) {
+      if (!x.c || !x.d) continue;
+      const k = x.c + "|" + x.d, old = items.get(k);
+      items.set(k, old ? { ...old, ...x, hi: Math.max(old.hi || 0, x.hi || 0) } : { ...x });
+    }
+    return { items: [...items.values()] };
+  }
+  function updateRegistry(reg, spot, today, isTrading, ztPools) {
+    const items = new Map(reg.items.map((x) => [x.c + "|" + x.d, { ...x }]));
+    const hiToday = new Map(spot.map((r) => [r.code, r.high]));
+    if (isTrading) {
+      for (const x of items.values()) { const hh = hiToday.get(x.c); if (isN(hh)) x.hi = rn(Math.max(x.hi || 0, hh)); }
+      for (const r of spot) {
+        const lim = limitPct(r.code);
+        if (r.pct >= Math.max(6, 0.5 * lim) && (r.vol_ratio >= 2 || r.pct >= lim - 0.3))
+          items.set(r.code + "|" + today, { c: r.code, d: today, p: rn(r.price), hi: rn(r.high), pct: rn(r.pct, 1), vr: rn(r.vol_ratio, 1) });
+      }
+    }
+    for (const { d, m } of ztPools) for (const [c, info] of m) {
+      if (!items.has(c + "|" + d)) items.set(c + "|" + d, { c, d, p: info.p, hi: info.p, pct: info.pct, vr: null });
+    }
+    const cutoff = new Date(Date.parse(today + "T00:00:00Z") - 45 * 86400000).toISOString().slice(0, 10);
+    const out = [...items.values()].filter((x) => x.d >= cutoff).sort((a, b) => (a.d + a.c).localeCompare(b.d + b.c));
+    return { updated: today, items: out };
+  }
+  function setupCandidates(reg, spot, today) {
+    const price = new Map(spot.map((r) => [r.code, r.price]));
+    const latest = new Map();
+    for (const x of reg.items) {
+      const cur = latest.get(x.c);
+      const hiAll = Math.max((cur && cur.hi_all) || 0, x.hi || x.p || 0);
+      if (!cur || x.d > cur.d) latest.set(x.c, { ...x, hi_all: hiAll }); else cur.hi_all = hiAll;
+    }
+    const cutoff = new Date(Date.parse(today + "T00:00:00Z") - 36 * 86400000).toISOString().slice(0, 10);
+    const out = new Set();
+    for (const [c, x] of latest) {
+      const C = price.get(c), hi = x.hi_all || 0, p = x.p || 0;
+      if (!isN(C) || x.d < cutoff || hi <= 0 || p <= 0) continue;
+      if (C <= 0.93 * hi && C >= 0.75 * p) out.add(c);
+    }
+    return out;
+  }
+
   // ───────── 主流程 ─────────
   async function run({ onProgress = () => {} } = {}) {
     const t0 = Date.now();
@@ -426,6 +571,7 @@
     const tdP = tradingDates(CONFIG.pattern_days + 1);
     const finP = fetchFinancials(today);
     const ztP = tdP.then((td) => Promise.all(td.slice(-CONFIG.pattern_days).map((d) => fetchZtPool(d).then((m) => ({ d, m }), () => null))));
+    const regP = loadRegistry();
     const tdates = await tdP;
     const ltd = tdates[tdates.length - 1];
     const prevTd = tdates[tdates.length - 2];
@@ -485,11 +631,16 @@
     }
     if (!poolOk) zt = patBase;
     const patCand = new Set([...zt].filter((c) => patBase.has(c)));
+    const registry = updateRegistry(await regP, spot, today, isTrading, (await ztP).filter(Boolean));
+    ls.set(REG_KEY, registry);
+    const baseCodes = new Set(base.map((r) => r.code));
+    const setupCand = new Set([...setupCandidates(registry, spot, today)].filter((c) => baseCodes.has(c)));
+    meta.setup_cand = setupCand.size;
     meta.zt_pool = poolOk ? zt.size : null;
 
     const byCode = new Map(base.map((r) => [r.code, r]));
-    const need = [...new Set([...compCand, ...patCand])];
-    const tech = new Map(), pats = new Map();
+    const need = [...new Set([...compCand, ...patCand, ...setupCand])];
+    const tech = new Map(), pats = new Map(), setups = new Map();
     let done = 0, fromCache = 0;
     const cache = await idb.getMany(need);
     const toStore = [];
@@ -509,6 +660,7 @@
         if (k && k.length >= CONFIG.min_kline_days) {
           tech.set(code, technicals(k, r.vol_ratio));
           if (patCand.has(code)) { const p = detectPatterns(k, code, today, frac); if (p) pats.set(code, p); }
+          if (setupCand.has(code)) { const su = detectSetup(k, code, today, frac); if (su) setups.set(code, su); }
         }
         return null;
       } catch (e) { return code; }
@@ -554,6 +706,17 @@
     };
     const strong = patternList("strong", (a, b) => (b.zt_count - a.zt_count) || ((b.chg_n || 0) - (a.chg_n || 0)));
     const pullback = patternList("pullback", (a, b) => (b.score || 0) - (a.score || 0));
+    const setup = [];
+    for (const [code, su] of setups) {
+      if (!scoredMap.has(code) || !tech.has(code)) continue;
+      const rec = stockRecord(scoredMap.get(code), tech.get(code));
+      rec.reasons = [...su.setup_why, ...rec.reasons.filter((w) => !su.setup_why.includes(w))].slice(0, 6);
+      const { setup_why, ...rest } = su;
+      Object.assign(rec, rest);
+      setup.push(rec);
+    }
+    setup.sort((a, b) => (b.setup_score - a.setup_score) || (a.dist_high - b.dist_high));
+    const setupList = setup.slice(0, CONFIG.setup_max_list).map((r, i) => ({ ...r, rank: i + 1 }));
 
     const indCount = new Map();
     picks.forEach((p) => p.industry && indCount.set(p.industry, (indCount.get(p.industry) || 0) + 1));
@@ -561,11 +724,11 @@
     meta.diag = { zt_pool_ok: poolOk, fin_coverage: rn(df.filter((r) => isN(r.roe_annual)).length / (df.length || 1), 2) };
     onProgress("完成", 100);
     return {
-      ...meta, status: "ok", market, picks, strong, pullback,
+      ...meta, status: "ok", market, picks, strong, pullback, setup: setupList,
       top_industries: [...indCount].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count })),
       config: CONFIG,
     };
   }
 
-  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, barsFromCache, tradingDates } };
+  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, detectSetup, barsFromCache, tradingDates } };
 })();
