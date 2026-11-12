@@ -813,7 +813,14 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
   // ───────── 立即运行：在这台手机/电脑上直接选股 ─────────
   const LOCAL_KEY = "localRun";
   let armed = false, armTimer = null, localRunning = false;
-  function loadLocal() { try { return JSON.parse(localStorage.getItem(LOCAL_KEY) || "null"); } catch { return null; } }
+  const ENGINE_VERSION = "2.4-tx-web";   // 本机运行的程序版本；旧版本跑出来的结果不再用
+  function loadLocal() {
+    try {
+      const l = JSON.parse(localStorage.getItem(LOCAL_KEY) || "null");
+      if (l && l.version !== ENGINE_VERSION) { localStorage.removeItem(LOCAL_KEY); return null; }
+      return l;
+    } catch { return null; }
+  }
   function saveLocal(r) { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(r)); } catch {} }
   function preferLocal(date, synced) {
     const l = loadLocal();
@@ -841,6 +848,7 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     n.hidden = true; n.dataset.src = "";
     try {
       await loadEngine();
+      if (window.AStockEngine.VERSION !== ENGINE_VERSION) throw new Error("页面程序已更新，请刷新一下页面再运行");
       const r = await window.AStockEngine.run({ onProgress: (t, pct) => { txt.textContent = t; bar.style.width = Math.max(1, Math.min(100, pct)) + "%"; } });
       saveLocal(r);
       runs.set(r.trade_date, r);
