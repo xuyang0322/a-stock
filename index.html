@@ -295,8 +295,8 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
     <div class="sec-h"><h2 id="picks-h">选股结果</h2><span class="sub" id="picks-sub"></span></div>
     <div class="tabs-wrap">
       <div class="seg" id="tabs" role="tablist" aria-label="榜单" hidden>
-        <button role="tab" type="button" data-tab="setup" aria-selected="true">回调蓄势 <span class="n" id="cnt-setup">0</span></button>
-        <button role="tab" type="button" data-tab="picks" aria-selected="false">强势精选 <span class="n" id="cnt-picks">0</span></button>
+        <button role="tab" type="button" data-tab="picks" aria-selected="true">强势精选 <span class="n" id="cnt-picks">0</span></button>
+        <button role="tab" type="button" data-tab="setup" aria-selected="false">回调蓄势 <span class="n" id="cnt-setup">0</span></button>
         <button role="tab" type="button" data-tab="strong" aria-selected="false">涨停强势 <span class="n" id="cnt-strong">0</span></button>
         <button role="tab" type="button" data-tab="pullback" aria-selected="false">涨停小回调 <span class="n" id="cnt-pullback">0</span></button>
       </div>
@@ -437,7 +437,7 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
   const $ = (id) => document.getElementById(id);
   const runs = new Map();
   let order = [], current = null, statusDoc = null;
-  let industry = "", query = "", sortKey = "setup_score", tab = "setup";
+  let industry = "", query = "", sortKey = "score", tab = "picks";
   const open = new Set();
 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -465,8 +465,8 @@ footer{font-size:.85rem;color:var(--soft);line-height:1.8;max-width:62ch}
   $("totop").addEventListener("click", () => window.scrollTo({ top: 0 }));
 
   const TABS = {
-    setup: { sort: "setup_score", note: "先放量大涨过一波（第一个箭头），之后缩量回调到位、没有破位（第二个箭头）。「企稳回升」是今天已经止跌放量，「缩量到位」是量缩到最小、还没回升。", empty: "今天没有回调到位的强势股" },
     picks: { sort: "score", note: "七个条件全部满足：运行时涨 1%–3%、量比 1 以上、换手 5%–15%、市值 50–200 亿、短期均线多头且 60 日线向上、成交量连续 3 天放大、分时图全天强于大盘。再按资金面和走势打分排序。", empty: "今天没有股票同时满足全部七个条件" },
+    setup: { sort: "setup_score", note: "先放量大涨过一波（第一个箭头），之后缩量回调到位、没有破位（第二个箭头）。「企稳回升」是今天已经止跌放量，「缩量到位」是量缩到最小、还没回升。", empty: "今天没有回调到位的强势股" },
     strong: { sort: "zt_count", note: "最近 5 个交易日涨停过、而且这 5 天是上涨的股票。不看基本面，综合得分作参考。", empty: "最近 5 个交易日没有符合条件的涨停股" },
     pullback: { sort: "score", note: "涨停后小幅回落 0% 到 2%、成交量一天比涨停那天小的股票。", empty: "今天没有涨停后小幅回调的股票" },
   };
