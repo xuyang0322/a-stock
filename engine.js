@@ -1,12 +1,12 @@
 /*
  * A股每日选股 · 浏览器版选股引擎
- * 与 screener.py v2.0-tx 同一套规则，在看网页的人自己的手机/电脑上运行。
+ * 与 screener.py v2.4-tx 同一套规则，在看网页的人自己的手机/电脑上运行。
  * 数据：腾讯行情 qt.gtimg.cn、腾讯日K web.ifzq.gtimg.cn、东方财富财报 datacenter-web、涨停池 push2ex（都允许网页直接访问）。
  * 用法：const result = await AStockEngine.run({ onProgress: (text, pct) => {} });
  */
 (function () {
   "use strict";
-  const VERSION = "2.3-tx-web";
+  const VERSION = "2.4-tx-web";
   const CONFIG = {
     top_n: 30, tech_candidates: 300,
     exclude_st: true, exclude_limit: true,
@@ -16,6 +16,13 @@
     pattern_days: 5, pattern_min_mcap_yi: 50, pattern_min_amount_yi: 0,
     pullback_range: [-2.0, 0.0], pattern_max_list: 50,
     setup_lookback: 25, setup_min_amp: 0.15, setup_pull_days: [3, 20], setup_retrace: [0.3, 1.15], setup_max_list: 40,
+    max_mcap_yi: 200,                       // 总市值 ≤ 200 亿（所有榜单）
+    pick_pct_range: [1.0, 3.0],             // 强势精选：运行时涨幅 1%–3%
+    pick_min_vol_ratio: 1.0,                // 量比 ≥ 1
+    pick_turnover_range: [5.0, 15.0],       // 换手率 5%–15%
+    pick_vol_days: 3,                       // 成交量连续 N 天放大
+    pick_rs_min: 0.5,                       // 分时强于大盘：现在涨幅比对应指数至少高 0.5 个百分点
+    pick_rs_share: 0.7,                     // 且全天至少 70% 的时间跑赢指数
   };
 
   // ───────── 工具 ─────────
@@ -278,6 +285,62 @@
     const am = Math.max(0, Math.min(t, 11 * 60 + 30) - (9 * 60 + 30));
     const pm = Math.max(0, Math.min(t, 15 * 60) - 13 * 60);
     return Math.max((am + pm) / 240, 0.05);
+  }
+
+  // ───────── 强势精选：均线 + 量能 + 分时强于大盘 ─────────
+  function pickChecks(k, today, frac) {
+    const n = k ? k.length : 0;
+    if (n < 70) return null;
+    const c = k.map((x) => x.close), v = k.map((x) => x.volume);
+    if (k[n - 1].date === today && frac < 1) v[n - 1] = v[n - 1] / frac;
+    const ma = (w, off = 0) => mean(c.slice(n - w - off, n - off));
+    const m5 = ma(5), m10 = ma(10), m20 = ma(20), m60 = ma(60), m5p = ma(5, 3), m60p = ma(60, 5);
+    const maOk = m5 >= m10 && m10 >= m20 && m5 > m5p && m60 > m60p && c[n - 1] > m60;
+    const d = CONFIG.pick_vol_days, last = v.slice(-d);
+    let volOk = last[last.length - 1] >= 1.1 * last[0];
+    for (let i = 1; i < d; i++) if (!(last[i] >= 0.95 * last[i - 1])) volOk = false;
+    return { ma_ok: !!maOk, vol_ok: !!volOk, vol_days: d, ma5: rn(m5), ma10: rn(m10), ma20_: rn(m20),
+      ma60_up_pct: rn((m60 / m60p - 1) * 100), vol_seq: last.map((x) => rn(x / 1e4, 1)) };
+  }
+  const indexFor = (code) => (/^(688|689)/.test(code) ? "sh000688" : /^(300|301)/.test(code) ? "sz399006" : code.startsWith("6") ? "sh000001" : "sz399001");
+  async function fetchMinute(sym) {
+    const j = await fetchRetry("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=" + sym, { tries: 3, timeout: 10000 });
+    const d = (j.data && j.data[sym]) || {};
+    const qt = (d.qt && d.qt[sym]) || [];
+    const prev = qt.length > 4 ? num(qt[4]) : NaN;
+    const pts = [];
+    for (const row of ((d.data && d.data.data) || [])) { const f = String(row).split(/\s+/); if (f.length >= 2) pts.push([f[0], num(f[1])]); }
+    return { prev, pts };
+  }
+  async function relativeStrength(codes, byCode) {
+    const idxCache = new Map();
+    const idxSeries = async (sym) => {
+      if (!idxCache.has(sym)) {
+        try {
+          const { prev, pts } = await fetchMinute(sym);
+          idxCache.set(sym, prev > 0 ? new Map(pts.map(([t, p]) => [t, (p / prev - 1) * 100])) : new Map());
+        } catch (e) { idxCache.set(sym, new Map()); }
+      }
+      return idxCache.get(sym);
+    };
+    for (const sym of new Set(codes.map(indexFor))) await idxSeries(sym);
+    const out = new Map();
+    await pool(codes, 4, async (code) => {
+      try {
+        const r = byCode.get(code);
+        const { prev, pts } = await fetchMinute((r.mkt === 1 ? "sh" : "sz") + code);
+        const idx = await idxSeries(indexFor(code));
+        if (!(prev > 0) || !pts.length || !idx.size) return;
+        const diffs = pts.filter(([t]) => idx.has(t)).map(([t, p]) => (p / prev - 1) * 100 - idx.get(t));
+        if (diffs.length < 30) return;
+        const rsNow = diffs[diffs.length - 1], share = diffs.filter((x) => x > 0).length / diffs.length;
+        const k3 = Math.max(1, Math.floor(diffs.length / 3));
+        const trend = mean(diffs.slice(-k3)) - mean(diffs.slice(0, k3));
+        out.set(code, { rs_ok: rsNow >= CONFIG.pick_rs_min && share >= CONFIG.pick_rs_share, rs_now: rn(rsNow), rs_share: rn(share * 100, 0),
+          rs_trend: rn(trend), idx_pct: rn((pts[pts.length - 1][1] / prev - 1) * 100 - rsNow), idx_name: indexFor(code) });
+      } catch (e) { /* 分时拿不到就不入选 */ }
+    });
+    return out;
   }
 
   // ───────── 指标 ─────────
@@ -600,7 +663,7 @@
     const minM = Math.min(CONFIG.min_mcap_yi, CONFIG.pattern_min_mcap_yi) * 1e8;
     const minA = Math.min(CONFIG.min_amount_yi, CONFIG.pattern_min_amount_yi) * 1e8;
     const base = df.filter((r) => r.price > 0 && !(CONFIG.exclude_st && /ST|退/.test(r.name || "")) &&
-      r.mcap >= minM && r.amount > 0 && r.amount >= minA);
+      r.mcap >= minM && (!CONFIG.max_mcap_yi || r.mcap <= CONFIG.max_mcap_yi * 1e8) && r.amount > 0 && r.amount >= minA);
 
     const fR = [pctRank(base.map((r) => r.roe_annual)), pctRank(base.map((r) => r.rev_yoy)), pctRank(base.map((r) => r.profit_yoy)),
       pctRank(base.map((r) => r.gross_margin)), pctRank(base.map((r) => (r.pe_ttm > 0 ? r.pe_ttm : NaN)), false)];
@@ -611,16 +674,25 @@
     });
 
     const pe = CONFIG.pe_ttm_range;
-    const strict = base.filter((r) => r.mcap >= CONFIG.min_mcap_yi * 1e8 && r.amount >= CONFIG.min_amount_yi * 1e8 &&
+    let strict = base.filter((r) => r.mcap >= CONFIG.min_mcap_yi * 1e8 && r.amount >= CONFIG.min_amount_yi * 1e8 &&
       (!pe || (r.pe_ttm > pe[0] && r.pe_ttm <= pe[1])) &&
       (CONFIG.min_roe_annual == null || r.roe_annual >= CONFIG.min_roe_annual) &&
       (CONFIG.min_profit_yoy == null || (isN(r.profit_yoy) ? r.profit_yoy : -999) >= CONFIG.min_profit_yoy) &&
       (!CONFIG.exclude_limit || Math.abs(r.pct) < limitPct(r.code) - 0.3));
+    const funnel = { "基础池": base.length };
+    const [p0, p1] = CONFIG.pick_pct_range;
+    strict = strict.filter((r) => r.pct >= p0 && r.pct <= p1);
+    funnel["涨幅1-3%"] = strict.length;
+    strict = strict.filter((r) => r.vol_ratio >= CONFIG.pick_min_vol_ratio);
+    funnel["量比≥1"] = strict.length;
+    const [t0_, t1_] = CONFIG.pick_turnover_range;
+    strict = strict.filter((r) => r.turnover >= t0_ && r.turnover <= t1_);
+    funnel["换手5-15%"] = strict.length;
     meta.after_filter = strict.length;
     const wf = CONFIG.weights.fundamental;
     const pre = (r) => wf * r.f_score + (1 - wf) * r.c_score;
     const compCand = new Set(strict.slice().sort((a, b) => pre(b) - pre(a))
-      .slice(0, CONFIG.tech_candidates).map((r) => r.code));
+      .slice(0, Math.max(CONFIG.tech_candidates, 400)).map((r) => r.code));
 
     const patBase = new Set(base.filter((r) => r.mcap >= CONFIG.pattern_min_mcap_yi * 1e8 && r.amount >= CONFIG.pattern_min_amount_yi * 1e8).map((r) => r.code));
     let zt = new Set(), poolOk = true;
@@ -640,7 +712,7 @@
 
     const byCode = new Map(base.map((r) => [r.code, r]));
     const need = [...new Set([...compCand, ...patCand, ...setupCand])];
-    const tech = new Map(), pats = new Map(), setups = new Map();
+    const tech = new Map(), pats = new Map(), setups = new Map(), picksChk = new Map();
     let done = 0, fromCache = 0;
     const cache = await idb.getMany(need);
     const toStore = [];
@@ -661,6 +733,7 @@
           tech.set(code, technicals(k, r.vol_ratio));
           if (patCand.has(code)) { const p = detectPatterns(k, code, today, frac); if (p) pats.set(code, p); }
           if (setupCand.has(code)) { const su = detectSetup(k, code, today, frac); if (su) setups.set(code, su); }
+          if (compCand.has(code)) { const pk = pickChecks(k, today, frac); if (pk) picksChk.set(code, pk); }
         }
         return null;
       } catch (e) { return code; }
@@ -676,16 +749,31 @@
     const scored = base.filter((r) => tech.has(r.code));
     scored.forEach((r) => { r.t_score = tech.get(r.code)[0]; r.score = w.fundamental * r.f_score + w.capital * r.c_score + w.technical * r.t_score; });
 
-    const comp = scored.filter((r) => compCand.has(r.code)).sort((a, b) => b.score - a.score).slice(0, CONFIG.top_n);
+    // 强势精选：均线 + 量能 + 分时强于大盘，全部满足
+    const compAll = scored.filter((r) => compCand.has(r.code));
+    funnel["有K线"] = compAll.length;
+    const okMa = compAll.filter((r) => (picksChk.get(r.code) || {}).ma_ok);
+    funnel["均线向上"] = okMa.length;
+    const okVol = okMa.filter((r) => picksChk.get(r.code).vol_ok);
+    funnel["量能连放"] = okVol.length;
+    onProgress("正在比对分时图与大盘", 98);
+    const rs = okVol.length ? await relativeStrength(okVol.map((r) => r.code), byCode) : new Map();
+    const okRs = okVol.filter((r) => (rs.get(r.code) || {}).rs_ok);
+    funnel["分时强于大盘"] = okRs.length;
+    meta.pick_funnel = funnel;
+    const comp = okRs.sort((a, b) => b.score - a.score).slice(0, CONFIG.top_n);
     const picks = comp.map((r, i) => {
       const rec = stockRecord(r, tech.get(r.code));
+      const pk = picksChk.get(r.code), rr = rs.get(r.code);
+      const tags = [`分时强于大盘(+${rr.rs_now.toFixed(1)})`, `量能连放${pk.vol_days}天`, "均线向上"];
       const p = pats.get(r.code);
-      if (p && p.pullback) rec.reasons.unshift("涨停缩量回调");
-      else if (p && p.strong) rec.reasons.unshift(`近${CONFIG.pattern_days}日涨停`);
-      rec.reasons = rec.reasons.slice(0, 6);
+      if (p && p.strong) tags.push(`近${CONFIG.pattern_days}日涨停`);
+      rec.reasons = [...tags, ...rec.reasons.filter((w) => !tags.includes(w))].slice(0, 6);
+      for (const [k2, v2] of Object.entries(pk)) if (k2 !== "ma_ok" && k2 !== "vol_ok") rec[k2] = v2;
+      for (const [k2, v2] of Object.entries(rr)) if (k2 !== "rs_ok") rec[k2] = v2;
       return { rank: i + 1, ...rec };
     });
-    meta.tech_scored = scored.filter((r) => compCand.has(r.code)).length;
+    meta.tech_scored = compAll.length;
 
     const scoredMap = new Map(scored.map((r) => [r.code, r]));
     const patternList = (key, cmp) => {
@@ -730,5 +818,5 @@
     };
   }
 
-  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, detectSetup, barsFromCache, tradingDates } };
+  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, detectSetup, pickChecks, fetchMinute, relativeStrength, barsFromCache, tradingDates } };
 })();
