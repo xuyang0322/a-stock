@@ -6,7 +6,7 @@
  */
 (function () {
   "use strict";
-  const VERSION = "2.3-tx-web";
+  const VERSION = "2.5-tx-web";
   const CONFIG = {
     top_n: 30, tech_candidates: 300,
     exclude_st: true, exclude_limit: true,
@@ -16,6 +16,8 @@
     pattern_days: 5, pattern_min_mcap_yi: 50, pattern_min_amount_yi: 0,
     pullback_range: [-2.0, 0.0], pattern_max_list: 50,
     setup_lookback: 25, setup_min_amp: 0.15, setup_pull_days: [3, 20], setup_retrace: [0.3, 1.15], setup_max_list: 40,
+    squeeze_min_score: 55, squeeze_max_list: 40, squeeze_fetch_max: 200, squeeze_fetch_seconds: 180,   // 粘合蓄势
+    squeeze_mcap_range: [50, 300], squeeze_exclude_industries: ["银行Ⅱ", "保险Ⅱ", "证券Ⅱ", "多元金融"],
   };
 
   // ───────── 工具 ─────────
@@ -234,9 +236,9 @@
     return rows.filter((r) => (seen.has(r.code) ? false : (seen.add(r.code), true)));
   }
 
-  async function fetchKline(mkt, code, lmt = 130) {
+  async function fetchKline(mkt, code, lmt = 130, tries = 5) {
     const sym = (+mkt === 1 ? "sh" : "sz") + code;
-    const j = await fetchRetry(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${sym},day,,,${lmt},qfq`, { tries: 5, timeout: 10000 });
+    const j = await fetchRetry(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${sym},day,,,${lmt},qfq`, { tries, timeout: 10000 });
     const d = (j.data && j.data[sym]) || {};
     const kl = d.qfqday || d.day || [];
     if (!kl.length) return null;
@@ -278,6 +280,106 @@
     const am = Math.max(0, Math.min(t, 11 * 60 + 30) - (9 * 60 + 30));
     const pm = Math.max(0, Math.min(t, 15 * 60) - 13 * 60);
     return Math.max((am + pm) / 240, 0.05);
+  }
+
+  // ───────── 粘合蓄势：均线粘合横盘 / 回踩均线 ─────────
+  function baseDays(c, h, lo, tol = 0.18) {
+    const px = c[c.length - 1];
+    let hi = h[h.length - 1], lw = lo[lo.length - 1], d = 1;
+    for (let i = c.length - 2; i > Math.max(-1, c.length - 121); i--) {
+      hi = Math.max(hi, h[i]); lw = Math.min(lw, lo[i]);
+      if ((hi - lw) / px > tol) break;
+      d++;
+    }
+    return d;
+  }
+  function pullbackToMa(c, o, h, lo, v, pct, lim, m5, m10, m20, m5p, m20p, m60, m60p, vr) {
+    const n = c.length, px = c[n - 1];
+    const H = Math.max(...h.slice(-30)), L = Math.min(...lo.slice(-30));
+    if (L <= 0 || H / L < 1.3) return null;
+    if (m20 / m20p - 1 < 0.05) return null;
+    const r = (H - px) / (H - L);
+    if (!(r >= 0.25 && r <= 0.65)) return null;
+    const d20 = (px / m20 - 1) * 100, d10 = (px / m10 - 1) * 100;
+    if (!((d20 >= -8 && d20 <= 5) || Math.abs(d10) <= 5)) return null;
+    if (vr > 1.05 || pct[n - 1] >= 0.45 * lim || pct[n - 1] < -1) return null;   // 今天还在跌的不算止跌
+    let iH = n - 1;
+    for (let j = n - 1; j >= n - 30; j--) if (h[j] > h[iH]) iH = j;   // 30 天内最高价所在日（取最近的一次最高）
+    for (let j = n - 1; j >= n - 30; j--) if (h[j] === h[iH]) { iH = j; break; }
+    if (n - 1 - iH < 3) return null;
+    let ups = 0;
+    for (let j = n - 1; j > 0; j--) { if (c[j] > c[j - 1]) ups++; else break; }
+    const turning = (m5 > m5p && c[n - 1] >= o[n - 1]) || (px > m5 && ups >= 2);
+    if (!turning) return null;
+    let s = 40; const why = ["回踩均线"];
+    s += (r >= 0.4 && r <= 0.6) ? 15 : 8;
+    s += vr <= 0.85 ? 15 : 8;
+    s += m5 > m5p ? 10 : 5;
+    s += ups >= 2 ? 10 : 0;
+    s += m60 > m60p ? 5 : 0;
+    s += Math.abs(d20) <= 4 ? 5 : 0;
+    if (ups >= 2) why.push(`连涨${ups}天`);
+    if (vr <= 0.85) why.push("量能回落");
+    why.push(`回撤${Math.round(r * 100)}%`);
+    if (s < CONFIG.squeeze_min_score) return null;
+    const [tdb, tds] = tdCounts(c);
+    return { sq_score: Math.min(s, 100), sq_sig: "回踩均线", sq_why: why.slice(0, 4),
+      ma_spread: rn((Math.max(m5, m10, m20) - Math.min(m5, m10, m20)) / px * 100), rng10: rn((Math.max(...h.slice(-10)) - Math.min(...lo.slice(-10))) / px * 100, 1),
+      vol_ratio_5_20: rn(vr), dist_ma20: rn(d20), ma20_slope: rn((m20 / m20p - 1) * 100), ma60_up: m60 > m60p,
+      base_days: n - 1 - iH, retrace: Math.round(r * 100), td_buy: tdb, td_sell: tds };
+  }
+  function detectSqueeze(k, code, today, frac) {
+    const n = k ? k.length : 0;
+    if (n < 62) return null;
+    const lim = limitPct(code);
+    const o = k.map((x) => x.open), c = k.map((x) => x.close), h = k.map((x) => x.high), lo = k.map((x) => x.low), v = k.map((x) => x.volume);
+    if (k[n - 1].date === today && frac < 1) v[n - 1] = v[n - 1] / frac;
+    const px = c[n - 1];
+    if (px <= 0 || v.slice(-20).reduce((a, b) => a + b, 0) <= 0) return null;
+    const pct = c.map((x, i) => (i ? (x / c[i - 1] - 1) * 100 : NaN));
+    const ma = (w, off = 0) => mean(c.slice(n - w - off, n - off));
+    const m5 = ma(5), m10 = ma(10), m20 = ma(20), m60 = ma(60);
+    const m5p = ma(5, 3), m20p = ma(20, 10), m60p = n >= 70 ? ma(60, 10) : m60;
+    const spread = (Math.max(m5, m10, m20) - Math.min(m5, m10, m20)) / px * 100;
+    const rng10 = (Math.max(...h.slice(-10)) - Math.min(...lo.slice(-10))) / px * 100;
+    const rng30 = (Math.max(...h.slice(-30)) - Math.min(...lo.slice(-30))) / px * 100;
+    const v20 = mean(v.slice(-20)), v5 = mean(v.slice(-5));
+    const vr = v20 > 0 ? v5 / v20 : 9;
+    const dist20 = (px / m20 - 1) * 100;
+    const max5 = Math.max(...pct.slice(-5));
+    if (pct[n - 1] >= 0.45 * lim || (max5 >= 0.6 * lim && spread > 6)) return null;
+    const pb = pullbackToMa(c, o, h, lo, v, pct, lim, m5, m10, m20, m5p, m20p, m60, m60p, vr);
+    if (pb) return pb;
+    if (spread > 6 || rng10 > 18 || Math.abs(dist20) > 5 || vr > 1.8 || pct[n - 1] <= -3) return null;   // 今天大跌的不算蓄势
+    if (m20 / m20p - 1 < -0.04 || px < m60 * 0.85) return null;
+    if (max5 >= 0.6 * lim) return null;
+    if (px > Math.max(...h.slice(-31, -1)) * 1.03) return null;
+    let s = 0; const why = [];
+    s += spread <= 1.5 ? 25 : spread <= 3 ? 18 : spread <= 4.5 ? 10 : 4;
+    why.push(`均线粘合${spread.toFixed(1)}%`);
+    s += rng10 <= 7 ? 20 : rng10 <= 10 ? 15 : rng10 <= 14 ? 9 : 4;
+    if (rng30 > 0 && rng10 / rng30 <= 0.6) { s += 5; why.push("波动收窄"); }
+    s += vr <= 0.8 ? 15 : vr <= 1.0 ? 11 : vr <= 1.3 ? 6 : 2;
+    if (vr <= 0.8) why.push("明显缩量");
+    if (px >= m20) s += 6;
+    if (px >= m10 && m5 >= m10) { s += 8; why.push("短均线开始向上排列"); }
+    if (m5 > m5p) s += 6;
+    if (m60 > m60p) { s += 5; why.push("60日线向上"); }
+    let trig = false;
+    for (let j = n - 3; j < n; j++) if (pct[j] >= 2 && v[j] >= 1.3 * v20 && c[j] > o[j]) trig = true;
+    if (trig) { s += 7; why.push("温和放量"); }
+    let td9 = false;
+    for (let j = n - 15; j < n; j++) {
+      let cnt = 0, i = j;
+      while (i >= 4 && c[i] < c[i - 4]) { cnt++; i--; }
+      if (cnt >= 9) td9 = true;
+    }
+    if (td9) { s += 5; why.push("九转买入到位"); }
+    if (s < CONFIG.squeeze_min_score) return null;
+    const sig = (trig || (px >= m10 && m5 >= m10 && m5 > m5p)) ? "蓄势待发" : "横盘粘合";
+    const [tdb, tds] = tdCounts(c);
+    return { sq_score: s, sq_sig: sig, sq_why: why.slice(0, 4), ma_spread: rn(spread), rng10: rn(rng10, 1), vol_ratio_5_20: rn(vr),
+      dist_ma20: rn(dist20), ma20_slope: rn((m20 / m20p - 1) * 100), ma60_up: m60 > m60p, base_days: baseDays(c, h, lo), td_buy: tdb, td_sell: tds };
   }
 
   // ───────── 指标 ─────────
@@ -639,8 +741,22 @@
     meta.zt_pool = poolOk ? zt.size : null;
 
     const byCode = new Map(base.map((r) => [r.code, r]));
-    const need = [...new Set([...compCand, ...patCand, ...setupCand])];
-    const tech = new Map(), pats = new Map(), setups = new Map();
+    // 粘合蓄势候选：今天没大涨大跌、量比不夸张；有缓存的全看，没缓存的每次最多新拉 N 只（轮换）
+    const others = new Set([...compCand, ...patCand, ...setupCand]);
+    const [sqM0, sqM1] = CONFIG.squeeze_mcap_range;
+    const sqEligible = new Set(base.filter((r) => Math.abs(r.pct) < 0.45 * limitPct(r.code) && (isN(r.vol_ratio) ? r.vol_ratio : 1) <= 2.5 && r.price >= 2
+      && r.mcap >= sqM0 * 1e8 && r.mcap <= sqM1 * 1e8 && !CONFIG.squeeze_exclude_industries.includes(String(r.industry || ""))).map((r) => r.code));
+    const sqAll = [...sqEligible].filter((c) => !others.has(c));
+    const sqCache = await idb.getMany(sqAll);
+    const sqCached = sqAll.filter((c) => sqCache.get(c)), sqNew = sqAll.filter((c) => !sqCache.get(c));
+    for (let i = sqNew.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [sqNew[i], sqNew[j]] = [sqNew[j], sqNew[i]]; }
+    const sqOptional = new Set(sqNew.slice(0, CONFIG.squeeze_fetch_max));   // 可选：拉不到、超时都不影响其他榜单
+    const squeezeCand = new Set([...sqCached, ...sqOptional]);
+    meta.squeeze_cand = squeezeCand.size;
+    const need = [...new Set([...others, ...sqCached])];
+    const tK0 = Date.now();
+    let sqSkipped = 0;
+    const tech = new Map(), pats = new Map(), setups = new Map(), squeezes = new Map();
     let done = 0, fromCache = 0;
     const cache = await idb.getMany(need);
     const toStore = [];
@@ -651,7 +767,8 @@
         let k = fromCacheBars(code, r);
         if (k) fromCache++;
         else {
-          k = await fetchKline(r.mkt, code);
+          if (sqOptional.has(code) && Date.now() - tK0 > CONFIG.squeeze_fetch_seconds * 1000) { sqSkipped++; return null; }
+          k = await fetchKline(r.mkt, code, 130, sqOptional.has(code) ? 1 : 5);
           if (k && k.length) {
             const keep = k.filter((b) => b.date < today || (b.date === today && sessionDone));
             toStore.push([code, { saved: now.iso, bars: keep.map((b) => [b.date, b.open, b.close, b.high, b.low, b.volume]) }]);
@@ -661,6 +778,7 @@
           tech.set(code, technicals(k, r.vol_ratio));
           if (patCand.has(code)) { const p = detectPatterns(k, code, today, frac); if (p) pats.set(code, p); }
           if (setupCand.has(code)) { const su = detectSetup(k, code, today, frac); if (su) setups.set(code, su); }
+          const sq = detectSqueeze(k, code, today, frac); if (sq) squeezes.set(code, sq);
         }
         return null;
       } catch (e) { return code; }
@@ -669,6 +787,12 @@
     let failed = (await pool(need, 8, job)).filter(Boolean);
     if (failed.length) { await sleep(3000); done = need.length - failed.length; failed = (await pool(failed, 2, job)).filter(Boolean); }
     meta.kline_failed = failed.length;
+    if (sqOptional.size) {   // 可选的粘合蓄势新候选放最后拉，有时间限制
+      const optList = [...sqOptional]; done = 0;
+      const optCache = await idb.getMany(optList); optList.forEach((c) => cache.set(c, optCache.get(c)));
+      const optFailed = (await pool(optList, 6, async (code) => { const r = await job(code); onProgress(`正在补充粘合蓄势候选 ${done}/${optList.length}`, 98); return r; })).filter(Boolean);
+      meta.squeeze_fetched = optList.length - optFailed.length;
+    }
     meta.kline_cached = fromCache;
     idb.putMany(toStore);
 
@@ -717,6 +841,20 @@
     }
     setup.sort((a, b) => (b.setup_score - a.setup_score) || (a.dist_high - b.dist_high));
     const setupList = setup.slice(0, CONFIG.setup_max_list).map((r, i) => ({ ...r, rank: i + 1 }));
+    // 粘合蓄势榜：回调蓄势里已经有的不重复
+    const squeeze = [];
+    for (const [code, sq] of squeezes) {
+      if (!scoredMap.has(code) || !tech.has(code) || setups.has(code) || !sqEligible.has(code)) continue;
+      const rec = stockRecord(scoredMap.get(code), tech.get(code));
+      const tags = [sq.sq_sig, ...sq.sq_why.filter((w) => w !== sq.sq_sig)];
+      rec.reasons = [...tags, ...rec.reasons.filter((w) => !tags.includes(w))].slice(0, 6);
+      const { sq_why, ...rest } = sq;
+      Object.assign(rec, rest);
+      squeeze.push(rec);
+    }
+    const sqOrder = { "蓄势待发": 0, "回踩均线": 0, "横盘粘合": 1 };
+    squeeze.sort((a, b) => ((sqOrder[a.sq_sig] ?? 2) - (sqOrder[b.sq_sig] ?? 2)) || (b.sq_score - a.sq_score) || ((b.score || 0) - (a.score || 0)));
+    const squeezeList = squeeze.slice(0, CONFIG.squeeze_max_list).map((r, i) => ({ ...r, rank: i + 1 }));
 
     const indCount = new Map();
     picks.forEach((p) => p.industry && indCount.set(p.industry, (indCount.get(p.industry) || 0) + 1));
@@ -724,11 +862,11 @@
     meta.diag = { zt_pool_ok: poolOk, fin_coverage: rn(df.filter((r) => isN(r.roe_annual)).length / (df.length || 1), 2) };
     onProgress("完成", 100);
     return {
-      ...meta, status: "ok", market, picks, strong, pullback, setup: setupList,
+      ...meta, status: "ok", market, picks, strong, pullback, setup: setupList, squeeze: squeezeList,
       top_industries: [...indCount].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count })),
       config: CONFIG,
     };
   }
 
-  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, detectSetup, barsFromCache, tradingDates } };
+  window.AStockEngine = { run, VERSION, _t: { fetchKline, fetchSpot, technicals, detectPatterns, detectSetup, detectSqueeze, barsFromCache, tradingDates } };
 })();
